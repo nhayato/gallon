@@ -30,7 +30,7 @@ func TestInputPluginDynamoDbConfigSchemaColumn_getValue_NullNumber(t *testing.T)
 			columnType:  "number",
 			value:       &types.AttributeValueMemberNULL{Value: true},
 			expected:    nil,
-			expectError: true, // 現在の実装ではエラーになる（修正後はfalseになるべき）
+			expectError: false, // NULL値はnilとして正しく処理される
 		},
 		{
 			name:        "string with valid value",
@@ -44,7 +44,7 @@ func TestInputPluginDynamoDbConfigSchemaColumn_getValue_NullNumber(t *testing.T)
 			columnType:  "string",
 			value:       &types.AttributeValueMemberNULL{Value: true},
 			expected:    nil,
-			expectError: true, // 現在の実装ではエラーになる（修正後はfalseになるべき）
+			expectError: false, // NULL値はnilとして正しく処理される
 		},
 		{
 			name:        "boolean with valid value",
@@ -58,7 +58,7 @@ func TestInputPluginDynamoDbConfigSchemaColumn_getValue_NullNumber(t *testing.T)
 			columnType:  "boolean",
 			value:       &types.AttributeValueMemberNULL{Value: true},
 			expected:    nil,
-			expectError: true, // 現在の実装ではエラーになる（修正後はfalseになるべき）
+			expectError: false, // NULL値はnilとして正しく処理される
 		},
 		{
 			name:        "any with NULL value",
@@ -119,11 +119,20 @@ func TestInputPluginDynamoDbConfigSchemaColumn_getValue_NullInNestedObject(t *te
 	}
 
 	result, err := schema.getValue(value)
-	if err == nil {
-		t.Logf("Result: %v", result)
-		t.Log("Note: This test currently expects error. After fix, it should return {name: Alice, age: nil}")
-	} else {
-		t.Logf("Got expected error (current behavior): %v", err)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	resultMap, ok := result.(map[string]any)
+	if !ok {
+		t.Fatalf("expected map[string]any, got %T", result)
+	}
+
+	if resultMap["name"] != "Alice" {
+		t.Errorf("expected name to be 'Alice', got %v", resultMap["name"])
+	}
+	if resultMap["age"] != nil {
+		t.Errorf("expected age to be nil, got %v", resultMap["age"])
 	}
 }
 
@@ -146,10 +155,25 @@ func TestInputPluginDynamoDbConfigSchemaColumn_getValue_NullInArray(t *testing.T
 	}
 
 	result, err := schema.getValue(value)
-	if err == nil {
-		t.Logf("Result: %v", result)
-		t.Log("Note: This test currently expects error. After fix, it should return [1, nil, 3]")
-	} else {
-		t.Logf("Got expected error (current behavior): %v", err)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	resultSlice, ok := result.([]any)
+	if !ok {
+		t.Fatalf("expected []any, got %T", result)
+	}
+
+	if len(resultSlice) != 3 {
+		t.Fatalf("expected 3 elements, got %d", len(resultSlice))
+	}
+	if resultSlice[0] != "1" {
+		t.Errorf("expected first element to be '1', got %v", resultSlice[0])
+	}
+	if resultSlice[1] != nil {
+		t.Errorf("expected second element to be nil, got %v", resultSlice[1])
+	}
+	if resultSlice[2] != "3" {
+		t.Errorf("expected third element to be '3', got %v", resultSlice[2])
 	}
 }
