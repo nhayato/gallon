@@ -126,6 +126,11 @@ type InputPluginDynamoDbConfigSchemaColumn struct {
 }
 
 func (c InputPluginDynamoDbConfigSchemaColumn) getValue(v types.AttributeValue) (any, error) {
+	// Handle NULL for all types
+	if _, ok := v.(*types.AttributeValueMemberNULL); ok {
+		return nil, nil
+	}
+
 	switch c.Type {
 	case "string":
 		value, ok := v.(*types.AttributeValueMemberS)

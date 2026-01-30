@@ -544,6 +544,148 @@ out:
 	}
 }
 
+func Test_dynamodb_null_number(t *testing.T) {
+	// Prepare test data - number型のフィールドにNULLが入っている場合のテスト
+	tableName := "null_number_test"
+	ctx := context.Background()
+
+	// Create table
+	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName: aws.String(tableName),
+		AttributeDefinitions: []types.AttributeDefinition{
+			{
+				AttributeName: aws.String("id"),
+				AttributeType: types.ScalarAttributeTypeS,
+			},
+		},
+		KeySchema: []types.KeySchemaElement{
+			{
+				AttributeName: aws.String("id"),
+				KeyType:       types.KeyTypeHash,
+			},
+		},
+		BillingMode: types.BillingModePayPerRequest,
+	})
+	if err != nil {
+		t.Fatalf("Failed to create table: %v", err)
+	}
+
+	// Insert test data with NULL number field
+	// レコード1: ageがnumber値
+	_, err = client.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName: aws.String(tableName),
+		Item: map[string]types.AttributeValue{
+			"id":   &types.AttributeValueMemberS{Value: "user1"},
+			"name": &types.AttributeValueMemberS{Value: "Alice"},
+			"age":  &types.AttributeValueMemberN{Value: "30"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Failed to insert data: %v", err)
+	}
+
+	// レコード2: ageがNULL
+	_, err = client.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName: aws.String(tableName),
+		Item: map[string]types.AttributeValue{
+			"id":   &types.AttributeValueMemberS{Value: "user2"},
+			"name": &types.AttributeValueMemberS{Value: "Bob"},
+			"age":  &types.AttributeValueMemberNULL{Value: true},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Failed to insert data: %v", err)
+	}
+
+	// レコード3: ageフィールドが存在しない
+	_, err = client.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName: aws.String(tableName),
+		Item: map[string]types.AttributeValue{
+			"id":   &types.AttributeValueMemberS{Value: "user3"},
+			"name": &types.AttributeValueMemberS{Value: "Charlie"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Failed to insert data: %v", err)
+	}
+
+	// Prepare configuration
+	configYml := fmt.Sprintf(`
+in:
+  type: dynamodb
+  table: %s
+  endpoint: %v
+  schema:
+    id:
+      type: string
+    name:
+      type: string
+    age:
+      type: number
+out:
+  type: file
+  filepath: ./null_number_output.jsonl
+  format: jsonl
+`, tableName, endpoint)
+
+	defer func() {
+		os.Remove("./null_number_output.jsonl")
+	}()
+
+	// Run Gallon
+	if err := cmd.RunGallon([]byte(configYml)); err != nil {
+		t.Fatalf("Failed to run Gallon: %s", err)
+	}
+
+	// Validate output file
+	jsonl, err := os.ReadFile("./null_number_output.jsonl")
+	if err != nil {
+		t.Fatalf("Failed to read output file: %s", err)
+	}
+
+	lines := strings.Split(string(jsonl), "\n")
+	// Filter empty lines
+	var validLines []string
+	for _, line := range lines {
+		if line != "" {
+			validLines = append(validLines, line)
+		}
+	}
+
+	// 全3レコードが正常に処理されることを期待
+	if len(validLines) != 3 {
+		t.Fatalf("Expected 3 records, got %d. Lines: %v", len(validLines), validLines)
+	}
+
+	// 各レコードの検証
+	for _, line := range validLines {
+		var data map[string]any
+		if err := json.Unmarshal([]byte(line), &data); err != nil {
+			t.Errorf("Could not unmarshal JSON: %s, line: %s", err, line)
+			continue
+		}
+
+		id := data["id"].(string)
+		switch id {
+		case "user1":
+			// ageは数値の文字列
+			if data["age"] != "30" {
+				t.Errorf("Expected age to be '30', got %v", data["age"])
+			}
+		case "user2":
+			// ageはNULL -> nilになるべき
+			if data["age"] != nil {
+				t.Errorf("Expected age to be nil for user2, got %v", data["age"])
+			}
+		case "user3":
+			// ageフィールドは存在しない
+			if _, exists := data["age"]; exists {
+				t.Errorf("Expected age to not exist for user3, got %v", data["age"])
+			}
+		}
+	}
+}
+
 func Test_dynamodb_rename_columns(t *testing.T) {
 	configYml := fmt.Sprintf(`
 in:
