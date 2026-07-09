@@ -359,15 +359,8 @@ out:
 		if rand.Float32() < 0.1 {
 			metadataString := item["metadata"].(string)
 
-			// json type is formed as a string
-			var metadataRaw string
-			if err := json.Unmarshal([]byte(metadataString), &metadataRaw); err != nil {
-				t.Errorf("Could not unmarshal metadata: %s", err)
-				break
-			}
-
 			var metadata map[string]any
-			if err := json.Unmarshal([]byte(metadataRaw), &metadata); err != nil {
+			if err := json.Unmarshal([]byte(metadataString), &metadata); err != nil {
 				t.Errorf("Could not unmarshal metadata: %s", err)
 				break
 			}
