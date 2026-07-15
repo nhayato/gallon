@@ -3,6 +3,7 @@ package postgresql
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -199,5 +200,74 @@ out:
 
 	if strings.Count(string(jsonl), "\n") != 1000 {
 		t.Errorf("Expected 1000 lines, got %d", strings.Count(string(jsonl), "\n"))
+	}
+}
+
+// Test_pq_to_file_with_pagination_key exercises the keyset pagination path
+// (paginationKey config, see https://github.com/myuon/gallon/issues/40)
+// against a real PostgreSQL connection, with a small pageSize to force many
+// pages, to make sure the generated `$N`-style placeholders and `WHERE ... >
+// ... ORDER BY ...` clause are valid Postgres SQL and every row is still
+// extracted exactly once.
+func Test_pq_to_file_with_pagination_key(t *testing.T) {
+	configYml := fmt.Sprintf(`
+in:
+  type: sql
+  driver: postgres
+  table: users
+  database_url: %v
+  pageSize: 37
+  paginationKey: id
+  schema:
+    id:
+      type: string
+    name:
+      type: string
+    age:
+      type: int
+    created_at:
+      type: int
+out:
+  type: file
+  filepath: ./output_pagination_key.jsonl
+  format: jsonl
+`, dataSourceName)
+	defer func() {
+		if err := os.Remove("./output_pagination_key.jsonl"); err != nil {
+			t.Errorf("Could not remove output file: %s", err)
+		}
+	}()
+
+	if err := cmd.RunGallon([]byte(configYml)); err != nil {
+		t.Errorf("Could not run command: %s", err)
+	}
+
+	jsonl, err := os.ReadFile("./output_pagination_key.jsonl")
+	if err != nil {
+		t.Errorf("Could not read output file: %s", err)
+	}
+
+	lines := strings.Split(strings.TrimRight(string(jsonl), "\n"), "\n")
+	if len(lines) != 1000 {
+		t.Errorf("Expected 1000 lines, got %d", len(lines))
+	}
+
+	seen := map[string]int{}
+	for _, line := range lines {
+		var record map[string]interface{}
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
+			t.Fatalf("Failed to parse line: %v", err)
+		}
+		id, ok := record["id"].(string)
+		if !ok {
+			t.Fatalf("id is not a string: %v", record["id"])
+		}
+		seen[id]++
+	}
+
+	for id, count := range seen {
+		if count != 1 {
+			t.Errorf("id=%v was extracted %d times, want exactly 1", id, count)
+		}
 	}
 }

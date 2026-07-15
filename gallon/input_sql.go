@@ -55,13 +55,14 @@ func parseTimezone(tz string) (*time.Location, error) {
 }
 
 type InputPluginSql struct {
-	logger    logr.Logger
-	client    *sql.DB
-	tableName string
-	rawQuery  string
-	driver    string
-	pageSize  int
-	serialize func(orderedmap.OrderedMap[string, any]) (GallonRecord, error)
+	logger        logr.Logger
+	client        *sql.DB
+	tableName     string
+	rawQuery      string
+	driver        string
+	pageSize      int
+	paginationKey string
+	serialize     func(orderedmap.OrderedMap[string, any]) (GallonRecord, error)
 }
 
 func NewInputPluginSql(
@@ -72,13 +73,32 @@ func NewInputPluginSql(
 	pageSize int,
 	serialize func(orderedmap.OrderedMap[string, any]) (GallonRecord, error),
 ) *InputPluginSql {
+	return NewInputPluginSqlWithPaginationKey(client, tableName, rawQuery, driver, pageSize, "", serialize)
+}
+
+// NewInputPluginSqlWithPaginationKey is the same as NewInputPluginSql, but additionally
+// accepts a paginationKey. When paginationKey is non-empty, Extract paginates using
+// keyset pagination (`WHERE <paginationKey> > ? ORDER BY <paginationKey> LIMIT ?`)
+// instead of the default `LIMIT ? OFFSET ?`, which avoids duplicated/skipped rows
+// when the source table is concurrently modified during a long-running extraction
+// (see: https://github.com/myuon/gallon/issues/40).
+func NewInputPluginSqlWithPaginationKey(
+	client *sql.DB,
+	tableName string,
+	rawQuery string,
+	driver string,
+	pageSize int,
+	paginationKey string,
+	serialize func(orderedmap.OrderedMap[string, any]) (GallonRecord, error),
+) *InputPluginSql {
 	return &InputPluginSql{
-		client:    client,
-		tableName: tableName,
-		rawQuery:  rawQuery,
-		driver:    driver,
-		pageSize:  pageSize,
-		serialize: serialize,
+		client:        client,
+		tableName:     tableName,
+		rawQuery:      rawQuery,
+		driver:        driver,
+		pageSize:      pageSize,
+		paginationKey: paginationKey,
+		serialize:     serialize,
 	}
 }
 
@@ -109,7 +129,111 @@ func (p *InputPluginSql) sourceName() string {
 	return p.tableName
 }
 
+// sqlBindPlaceholder returns the driver-specific bind parameter placeholder
+// for the nth (1-indexed) argument of a query.
+func sqlBindPlaceholder(driver string, n int) (string, error) {
+	switch driver {
+	case "mysql":
+		return "?", nil
+	case "postgres":
+		return fmt.Sprintf("$%d", n), nil
+	default:
+		return "", fmt.Errorf("unsupported driver: %v", driver)
+	}
+}
+
+// sqlFromClause returns the `FROM` target for the paged query: the table name
+// as-is in table mode, or the user's raw query wrapped as a subquery in raw
+// query mode (so that both modes can be paginated the same way).
+func sqlFromClause(tableName, rawQuery string) string {
+	if rawQuery != "" {
+		return fmt.Sprintf("(%s) AS __gallon_raw_query", rawQuery)
+	}
+
+	return tableName
+}
+
+// buildLegacyPagedQuery builds the offset-based paginated query. This is the
+// default, backward-compatible pagination strategy used when no
+// paginationKey is configured. It has no deterministic ORDER BY, so page
+// boundaries can shift if the source table is modified concurrently
+// (see: https://github.com/myuon/gallon/issues/40).
+func buildLegacyPagedQuery(driver, tableName, rawQuery string, pageSize int) (string, error) {
+	offsetPlaceholder, err := sqlBindPlaceholder(driver, 1)
+	if err != nil {
+		return "", err
+	}
+
+	return fmt.Sprintf(
+		"SELECT * FROM %s LIMIT %d OFFSET %s",
+		sqlFromClause(tableName, rawQuery),
+		pageSize,
+		offsetPlaceholder,
+	), nil
+}
+
+// buildKeysetPagedQueries builds the two queries used for keyset pagination:
+//   - firstPageQuery has no lower bound and is used to fetch the first page.
+//   - nextPageQuery filters rows strictly after the last seen paginationKey
+//     value, so a single run extracts every row at most once (no duplicates)
+//     and does not skip rows that are inserted during the run, regardless of
+//     concurrent modifications to the source table.
+//
+// Both queries order by paginationKey ascending, which is required for
+// keyset pagination to make deterministic forward progress. paginationKey
+// must therefore be a unique, sortable column (e.g. a primary key).
+func buildKeysetPagedQueries(driver, tableName, rawQuery, paginationKey string) (firstPageQuery string, nextPageQuery string, err error) {
+	firstLimitPlaceholder, err := sqlBindPlaceholder(driver, 1)
+	if err != nil {
+		return "", "", err
+	}
+	keyPlaceholder, err := sqlBindPlaceholder(driver, 1)
+	if err != nil {
+		return "", "", err
+	}
+	nextLimitPlaceholder, err := sqlBindPlaceholder(driver, 2)
+	if err != nil {
+		return "", "", err
+	}
+
+	from := sqlFromClause(tableName, rawQuery)
+
+	firstPageQuery = fmt.Sprintf(
+		"SELECT * FROM %s ORDER BY %s LIMIT %s",
+		from,
+		paginationKey,
+		firstLimitPlaceholder,
+	)
+	nextPageQuery = fmt.Sprintf(
+		"SELECT * FROM %s WHERE %s > %s ORDER BY %s LIMIT %s",
+		from,
+		paginationKey,
+		keyPlaceholder,
+		paginationKey,
+		nextLimitPlaceholder,
+	)
+
+	return firstPageQuery, nextPageQuery, nil
+}
+
 func (p *InputPluginSql) Extract(
+	ctx context.Context,
+	messages chan []GallonRecord,
+	errs chan error,
+) error {
+	// Keyset pagination is opt-in via paginationKey. It is the recommended
+	// setting for tables that receive concurrent writes during extraction,
+	// since it does not rely on OFFSET (see: https://github.com/myuon/gallon/issues/40).
+	// When paginationKey is not configured, fall back to the legacy
+	// OFFSET-based pagination for backward compatibility.
+	if p.paginationKey != "" {
+		return p.extractWithKeysetPagination(ctx, messages, errs)
+	}
+
+	return p.extractWithOffsetPagination(ctx, messages, errs)
+}
+
+func (p *InputPluginSql) extractWithOffsetPagination(
 	ctx context.Context,
 	messages chan []GallonRecord,
 	errs chan error,
@@ -119,41 +243,9 @@ func (p *InputPluginSql) Extract(
 
 	extractedTotal := 0
 
-	pagedQueryStatement := ""
-	if p.rawQuery != "" {
-		// Raw query mode: wrap user's query as subquery for pagination
-		if p.driver == "mysql" {
-			pagedQueryStatement = fmt.Sprintf(
-				"SELECT * FROM (%s) AS __gallon_raw_query LIMIT %d OFFSET ?",
-				p.rawQuery,
-				p.pageSize,
-			)
-		} else if p.driver == "postgres" {
-			pagedQueryStatement = fmt.Sprintf(
-				"SELECT * FROM (%s) AS __gallon_raw_query LIMIT %d OFFSET $1",
-				p.rawQuery,
-				p.pageSize,
-			)
-		} else {
-			return fmt.Errorf("unsupported driver: %v", p.driver)
-		}
-	} else {
-		// Table mode
-		if p.driver == "mysql" {
-			pagedQueryStatement = fmt.Sprintf(
-				"SELECT * FROM %v LIMIT %d OFFSET ?",
-				p.tableName,
-				p.pageSize,
-			)
-		} else if p.driver == "postgres" {
-			pagedQueryStatement = fmt.Sprintf(
-				"SELECT * FROM %v LIMIT %d OFFSET $1",
-				p.tableName,
-				p.pageSize,
-			)
-		} else {
-			return fmt.Errorf("unsupported driver: %v", p.driver)
-		}
+	pagedQueryStatement, err := buildLegacyPagedQuery(p.driver, p.tableName, p.rawQuery, p.pageSize)
+	if err != nil {
+		return err
 	}
 
 	query, err := p.client.Prepare(pagedQueryStatement)
@@ -213,6 +305,10 @@ loop:
 				msgs = append(msgs, r)
 			}
 
+			if err := rows.Close(); err != nil {
+				errs <- fmt.Errorf("failed to close sql rows: %v (error: %v)", p.sourceName(), err)
+			}
+
 			if len(msgs) > 0 {
 				messages <- msgs
 				extractedTotal += len(msgs)
@@ -232,17 +328,160 @@ loop:
 	return nil
 }
 
+// extractWithKeysetPagination extracts rows using keyset pagination
+// (`WHERE paginationKey > ? ORDER BY paginationKey LIMIT ?`). Unlike
+// OFFSET-based pagination, each page's lower bound is anchored to the last
+// row actually read, so rows inserted/deleted elsewhere in the table during
+// the run cannot shift a row across a page boundary: every row is extracted
+// at most once, and rows present at query time are not skipped.
+func (p *InputPluginSql) extractWithKeysetPagination(
+	ctx context.Context,
+	messages chan []GallonRecord,
+	errs chan error,
+) error {
+	firstPageQueryStatement, nextPageQueryStatement, err := buildKeysetPagedQueries(p.driver, p.tableName, p.rawQuery, p.paginationKey)
+	if err != nil {
+		return err
+	}
+
+	firstPageQuery, err := p.client.Prepare(firstPageQueryStatement)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := firstPageQuery.Close(); err != nil {
+			errs <- fmt.Errorf("failed to close sql query: %v (error: %v)", p.sourceName(), err)
+		}
+	}()
+
+	nextPageQuery, err := p.client.Prepare(nextPageQueryStatement)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := nextPageQuery.Close(); err != nil {
+			errs <- fmt.Errorf("failed to close sql query: %v (error: %v)", p.sourceName(), err)
+		}
+	}()
+
+	hasNext := true
+	isFirstPage := true
+	extractedTotal := 0
+	var lastKey any
+
+loop:
+	for hasNext {
+		select {
+		case <-ctx.Done():
+			break loop
+		default:
+			var rows *sql.Rows
+			var err error
+			if isFirstPage {
+				rows, err = firstPageQuery.Query(p.pageSize)
+			} else {
+				rows, err = nextPageQuery.Query(lastKey, p.pageSize)
+			}
+			if err != nil {
+				return err
+			}
+			if err := rows.Err(); err != nil {
+				return err
+			}
+
+			cols, err := rows.Columns()
+			if err != nil {
+				return err
+			}
+
+			keyIdx := -1
+			for i, col := range cols {
+				if col == p.paginationKey {
+					keyIdx = i
+					break
+				}
+			}
+			if keyIdx == -1 {
+				rows.Close()
+				return fmt.Errorf("paginationKey %q was not found in the result columns of %v", p.paginationKey, p.sourceName())
+			}
+
+			msgs := []GallonRecord{}
+			for rows.Next() {
+				columns := make([]any, len(cols))
+				columnPointers := make([]any, len(cols))
+				for i := range columns {
+					columnPointers[i] = &columns[i]
+				}
+
+				if err := rows.Scan(columnPointers...); err != nil {
+					errs <- fmt.Errorf("failed to scan sql table: %v (error: %v)", p.sourceName(), err)
+					continue
+				}
+
+				record := *orderedmap.New[string, any]()
+				for i, colName := range cols {
+					record.Set(colName, columns[i])
+				}
+
+				r, err := p.serialize(record)
+				if err != nil {
+					errs <- fmt.Errorf("failed to serialize sql table: %v (error: %v)", p.sourceName(), err)
+					continue
+				}
+
+				msgs = append(msgs, r)
+
+				// Track the last seen pagination key (rows are ordered
+				// ascending by paginationKey) so the next page can resume
+				// strictly after it.
+				if keyVal := columns[keyIdx]; keyVal != nil {
+					if b, ok := keyVal.([]byte); ok {
+						// mysql commonly returns string/varchar columns as
+						// []byte; normalize to string for the next bind
+						// parameter.
+						lastKey = string(b)
+					} else {
+						lastKey = keyVal
+					}
+				}
+			}
+
+			if err := rows.Close(); err != nil {
+				errs <- fmt.Errorf("failed to close sql rows: %v (error: %v)", p.sourceName(), err)
+			}
+
+			if len(msgs) > 0 {
+				messages <- msgs
+				extractedTotal += len(msgs)
+
+				p.logger.Info(fmt.Sprintf("extracted %v records", extractedTotal))
+			} else {
+				hasNext = false
+			}
+
+			isFirstPage = false
+		}
+	}
+	if extractedTotal == 0 {
+		p.logger.Info(fmt.Sprintf("no records found in %v", p.sourceName()))
+	}
+
+	return nil
+}
+
 func (p *InputPluginSql) CloseConnection() error {
 	return p.client.Close()
 }
 
 type InputPluginSqlConfig struct {
-	Table       string                                                          `yaml:"table"`
-	Query       string                                                          `yaml:"query"`
-	DatabaseUrl string                                                          `yaml:"database_url"`
-	Driver      string                                                          `yaml:"driver"`
-	PageSize    int                                                             `yaml:"pageSize"`
-	Schema      orderedmap.OrderedMap[string, InputPluginSqlConfigSchemaColumn] `yaml:"schema"`
+	Table         string                                                          `yaml:"table"`
+	Query         string                                                          `yaml:"query"`
+	DatabaseUrl   string                                                          `yaml:"database_url"`
+	Driver        string                                                          `yaml:"driver"`
+	PageSize      int                                                             `yaml:"pageSize"`
+	PaginationKey string                                                          `yaml:"paginationKey"`
+	Schema        orderedmap.OrderedMap[string, InputPluginSqlConfigSchemaColumn] `yaml:"schema"`
 }
 
 type InputPluginSqlConfigSchemaColumn struct {
@@ -459,12 +698,13 @@ func NewInputPluginSqlFromConfig(configYml []byte) (*InputPluginSql, error) {
 
 	// Raw query mode: schema is ignored, return values as-is
 	if dbConfig.Query != "" {
-		return NewInputPluginSql(
+		return NewInputPluginSqlWithPaginationKey(
 			db,
 			"",
 			dbConfig.Query,
 			dbConfig.Driver,
 			dbConfig.PageSize,
+			dbConfig.PaginationKey,
 			func(item orderedmap.OrderedMap[string, any]) (GallonRecord, error) {
 				record := NewGallonRecord()
 				for pair := item.Oldest(); pair != nil; pair = pair.Next() {
@@ -476,12 +716,13 @@ func NewInputPluginSqlFromConfig(configYml []byte) (*InputPluginSql, error) {
 	}
 
 	// Table mode: apply schema transformations
-	return NewInputPluginSql(
+	return NewInputPluginSqlWithPaginationKey(
 		db,
 		dbConfig.Table,
 		"",
 		dbConfig.Driver,
 		dbConfig.PageSize,
+		dbConfig.PaginationKey,
 		func(item orderedmap.OrderedMap[string, any]) (GallonRecord, error) {
 			record := NewGallonRecord()
 
