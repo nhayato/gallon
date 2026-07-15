@@ -1,9 +1,265 @@
 package gallon
 
 import (
+	"context"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/go-logr/logr"
+	orderedmap "github.com/wk8/go-ordered-map/v2"
 )
+
+// identitySerialize is a minimal serialize function that copies every column
+// from the source row into the GallonRecord as-is (no schema/type transform),
+// mirroring the raw-query-mode serializer in NewInputPluginSqlFromConfig.
+func identitySerialize(item orderedmap.OrderedMap[string, any]) (GallonRecord, error) {
+	record := NewGallonRecord()
+	for pair := item.Oldest(); pair != nil; pair = pair.Next() {
+		record.Set(pair.Key, pair.Value)
+	}
+
+	return record, nil
+}
+
+func Test_buildLegacyPagedQuery(t *testing.T) {
+	tests := []struct {
+		name      string
+		driver    string
+		tableName string
+		rawQuery  string
+		pageSize  int
+		want      string
+		wantErr   bool
+	}{
+		{
+			name:      "mysql table mode",
+			driver:    "mysql",
+			tableName: "users",
+			pageSize:  1000,
+			want:      "SELECT * FROM users LIMIT 1000 OFFSET ?",
+		},
+		{
+			name:      "postgres table mode",
+			driver:    "postgres",
+			tableName: "users",
+			pageSize:  1000,
+			want:      "SELECT * FROM users LIMIT 1000 OFFSET $1",
+		},
+		{
+			name:     "mysql raw query mode",
+			driver:   "mysql",
+			rawQuery: "SELECT id, name FROM users WHERE age > 50",
+			pageSize: 500,
+			want:     "SELECT * FROM (SELECT id, name FROM users WHERE age > 50) AS __gallon_raw_query LIMIT 500 OFFSET ?",
+		},
+		{
+			name:     "postgres raw query mode",
+			driver:   "postgres",
+			rawQuery: "SELECT id, name FROM users WHERE age > 50",
+			pageSize: 500,
+			want:     "SELECT * FROM (SELECT id, name FROM users WHERE age > 50) AS __gallon_raw_query LIMIT 500 OFFSET $1",
+		},
+		{
+			name:      "unsupported driver",
+			driver:    "sqlite3",
+			tableName: "users",
+			pageSize:  100,
+			wantErr:   true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := buildLegacyPagedQuery(tt.driver, tt.tableName, tt.rawQuery, tt.pageSize)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("buildLegacyPagedQuery() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantErr {
+				return
+			}
+			if got != tt.want {
+				t.Errorf("buildLegacyPagedQuery() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func Test_buildKeysetPagedQueries(t *testing.T) {
+	tests := []struct {
+		name          string
+		driver        string
+		tableName     string
+		rawQuery      string
+		paginationKey string
+		wantFirstPage string
+		wantNextPage  string
+		wantErr       bool
+	}{
+		{
+			name:          "mysql table mode",
+			driver:        "mysql",
+			tableName:     "users",
+			paginationKey: "id",
+			wantFirstPage: "SELECT * FROM users ORDER BY id LIMIT ?",
+			wantNextPage:  "SELECT * FROM users WHERE id > ? ORDER BY id LIMIT ?",
+		},
+		{
+			name:          "postgres table mode",
+			driver:        "postgres",
+			tableName:     "users",
+			paginationKey: "id",
+			wantFirstPage: "SELECT * FROM users ORDER BY id LIMIT $1",
+			wantNextPage:  "SELECT * FROM users WHERE id > $1 ORDER BY id LIMIT $2",
+		},
+		{
+			name:          "mysql raw query mode",
+			driver:        "mysql",
+			rawQuery:      "SELECT id, name FROM users WHERE age > 50",
+			paginationKey: "id",
+			wantFirstPage: "SELECT * FROM (SELECT id, name FROM users WHERE age > 50) AS __gallon_raw_query ORDER BY id LIMIT ?",
+			wantNextPage:  "SELECT * FROM (SELECT id, name FROM users WHERE age > 50) AS __gallon_raw_query WHERE id > ? ORDER BY id LIMIT ?",
+		},
+		{
+			name:          "postgres raw query mode",
+			driver:        "postgres",
+			rawQuery:      "SELECT id, name FROM users WHERE age > 50",
+			paginationKey: "id",
+			wantFirstPage: "SELECT * FROM (SELECT id, name FROM users WHERE age > 50) AS __gallon_raw_query ORDER BY id LIMIT $1",
+			wantNextPage:  "SELECT * FROM (SELECT id, name FROM users WHERE age > 50) AS __gallon_raw_query WHERE id > $1 ORDER BY id LIMIT $2",
+		},
+		{
+			name:          "unsupported driver",
+			driver:        "sqlite3",
+			tableName:     "users",
+			paginationKey: "id",
+			wantErr:       true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotFirst, gotNext, err := buildKeysetPagedQueries(tt.driver, tt.tableName, tt.rawQuery, tt.paginationKey)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("buildKeysetPagedQueries() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantErr {
+				return
+			}
+			if gotFirst != tt.wantFirstPage {
+				t.Errorf("buildKeysetPagedQueries() firstPage = %q, want %q", gotFirst, tt.wantFirstPage)
+			}
+			if gotNext != tt.wantNextPage {
+				t.Errorf("buildKeysetPagedQueries() nextPage = %q, want %q", gotNext, tt.wantNextPage)
+			}
+		})
+	}
+}
+
+// Test_InputPluginSql_KeysetPagination_NoDuplicatesOnConcurrentInsert reproduces
+// the scenario from https://github.com/myuon/gallon/issues/40: rows are
+// inserted into the source table while a paginated Extract() is still in
+// progress. With keyset pagination (paginationKey configured), every row
+// that existed at the time it was queried is extracted exactly once, and
+// rows appended after the current watermark are still picked up in a later
+// page - unlike the legacy OFFSET-based pagination, which has no
+// deterministic ordering and can duplicate or skip rows in this situation.
+func Test_InputPluginSql_KeysetPagination_NoDuplicatesOnConcurrentInsert(t *testing.T) {
+	columns := []string{"id", "name"}
+	initialIDs := []int64{1, 2, 4, 6, 7, 8, 9, 10, 11, 12}
+	initialRows := make([][]any, 0, len(initialIDs))
+	for _, id := range initialIDs {
+		initialRows = append(initialRows, []any{id, fmt.Sprintf("name-%d", id)})
+	}
+
+	const pageSize = 4
+
+	onQuery := func(callIndex int, tbl *fakeTable) {
+		// Right before the 2nd page is fetched (i.e. once the first page,
+		// containing ids 1,2,4,6, has already been read and the watermark
+		// is at id=6), simulate two concurrent writes to the source table:
+		//   - id=3: a row inserted with a key that sorts *before* the
+		//     current watermark. Under OFFSET pagination this is exactly
+		//     the kind of write that shifts page boundaries and causes
+		//     duplicate/skipped rows; keyset pagination simply will not
+		//     revisit it, which is expected/documented behavior.
+		//   - id=13: a row appended past the current maximum key, which
+		//     must still be picked up in a later page (no data loss for
+		//     genuinely new rows).
+		if callIndex == 1 {
+			tbl.insertLocked([]any{int64(3), "name-3-inserted-during-extraction"})
+			tbl.insertLocked([]any{int64(13), "name-13-inserted-during-extraction"})
+		}
+	}
+
+	db, _, err := newFakeSqlDB(columns, initialRows, onQuery)
+	if err != nil {
+		t.Fatalf("failed to create fake sql db: %v", err)
+	}
+	defer db.Close()
+
+	plugin := NewInputPluginSqlWithPaginationKey(db, "users", "", "mysql", pageSize, "id", identitySerialize)
+	plugin.ReplaceLogger(logr.Discard())
+
+	messages := make(chan []GallonRecord)
+	errs := make(chan error, 10)
+
+	var wg sync.WaitGroup
+	var allIDs []int64
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for msgs := range messages {
+			for _, m := range msgs {
+				idVal, ok := m.Get("id")
+				if !ok {
+					t.Errorf("record is missing id column")
+					continue
+				}
+				allIDs = append(allIDs, idVal.(int64))
+			}
+		}
+	}()
+
+	extractErr := func() error {
+		defer close(messages)
+		return plugin.Extract(context.Background(), messages, errs)
+	}()
+
+	wg.Wait()
+
+	if extractErr != nil {
+		t.Fatalf("Extract returned error: %v", extractErr)
+	}
+
+	select {
+	case err := <-errs:
+		t.Fatalf("unexpected error on errs channel: %v", err)
+	default:
+	}
+
+	seen := map[int64]int{}
+	for _, id := range allIDs {
+		seen[id]++
+	}
+
+	for id, count := range seen {
+		if count > 1 {
+			t.Errorf("id=%v was extracted %d times, want at most 1 (duplicate row - the exact bug from issue #40)", id, count)
+		}
+	}
+
+	// Every row that existed throughout the run must have been extracted
+	// (no skipped rows), and the row appended mid-run past the watermark
+	// (id=13) must have been picked up too.
+	wantPresent := append(append([]int64{}, initialIDs...), 13)
+	for _, id := range wantPresent {
+		if seen[id] == 0 {
+			t.Errorf("id=%v was not extracted at all (skipped row)", id)
+		}
+	}
+}
 
 func Test_parseTimezone(t *testing.T) {
 	tests := []struct {

@@ -209,6 +209,7 @@ in:
   driver: mysql
   table: users
   pageSize: 1000
+  paginationKey: id
   database_url: user:password@tcp(localhost:3306)/dbname
   schema:
     id:
@@ -256,6 +257,10 @@ in:
 - database_url: Database URL. This will be passed to `sql.Open` with the driver name.
   - For MySQL, it should be `user:password@tcp(host:port)/dbname` (See: [go-sql-driver/mysql](https://github.com/go-sql-driver/mysql#dsn-data-source-name))
 - pageSize: Number of records per page (optional, default: 1000)
+- paginationKey: Column name to paginate by using keyset pagination (`WHERE <paginationKey> > ? ORDER BY <paginationKey> LIMIT ?`) instead of the default `LIMIT ? OFFSET ?` (optional).
+  - Recommended for tables that receive concurrent inserts/deletes while being extracted: OFFSET-based pagination has no deterministic ordering, so page boundaries can shift and cause the same row to be extracted more than once, or a row to be skipped, when the source table changes mid-run (see [#40](https://github.com/myuon/gallon/issues/40)).
+  - Must be a column with unique, strictly-ordered values (typically the primary key, e.g. an auto-increment ID or a UUID column). Composite keys are not supported.
+  - When omitted, the default OFFSET-based pagination is used (unchanged behavior).
 - schema
   - type: `string`, `int`, `float`, `decimal`, `time`, `date`, `bool`, `json` are supported. NULL are always acceptable.
     - `date`: Returns YYYY-MM-DD formatted string. If you want to return time.Time object, specify `time` type.
