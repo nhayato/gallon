@@ -36,4 +36,5 @@ out:
       type: string
     created_at:
       type: integer
-#  deleteTemporaryTable: false
+#  format: json
+#  compression: gzip
