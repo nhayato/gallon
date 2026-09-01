@@ -85,8 +85,8 @@ func Test_decompressGzipForLoad(t *testing.T) {
 
 	tests := []struct {
 		name        string
-		format      string
-		compression string
+		format      bqFormat
+		compression bqCompression
 		endpoint    *string
 		want        bool
 	}{
@@ -109,8 +109,8 @@ func Test_parseBigQueryLoadOptions(t *testing.T) {
 		name        string
 		format      string
 		compression string
-		wantFormat  string
-		wantComp    string
+		wantFormat  bqFormat
+		wantComp    bqCompression
 		wantErr     string
 	}{
 		{name: "defaults", wantFormat: bqFormatJSON, wantComp: bqCompressionNone},

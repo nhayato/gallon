@@ -22,10 +22,13 @@ import (
 // BQ gzip JSON load jobs fail above this size instead of splitting the file.
 const gzipJSONMaxBytes = 4 << 30
 
+type bqFormat string
+type bqCompression string
+
 const (
-	bqFormatJSON      = "json"
-	bqCompressionNone = "none"
-	bqCompressionGzip = "gzip"
+	bqFormatJSON      bqFormat      = "json"
+	bqCompressionNone bqCompression = "none"
+	bqCompressionGzip bqCompression = "gzip"
 )
 
 type OutputPluginBigQuery struct {
@@ -37,8 +40,8 @@ type OutputPluginBigQuery struct {
 	schema               bigquery.Schema
 	deserialize          func(GallonRecord) ([]bigquery.Value, error)
 	deleteTemporaryTable bool
-	format               string
-	compression          string
+	format               bqFormat
+	compression          bqCompression
 }
 
 func NewOutputPluginBigQuery(
@@ -49,8 +52,8 @@ func NewOutputPluginBigQuery(
 	schema bigquery.Schema,
 	deserialize func(GallonRecord) ([]bigquery.Value, error),
 	deleteTemporaryTable bool,
-	format string,
-	compression string,
+	format bqFormat,
+	compression bqCompression,
 ) *OutputPluginBigQuery {
 	return &OutputPluginBigQuery{
 		client:               client,
@@ -103,25 +106,26 @@ func gzipJSONLoadReader(file *os.File, decompress bool) (io.ReadCloser, error) {
 	return file, nil
 }
 
-func parseBigQueryLoadOptions(format, compression string) (string, string, error) {
-	format = strings.ToLower(strings.TrimSpace(format))
-	switch format {
+func parseBigQueryLoadOptions(format, compression string) (bqFormat, bqCompression, error) {
+	parsedFormat := bqFormat(strings.ToLower(strings.TrimSpace(format)))
+	switch parsedFormat {
 	case "", bqFormatJSON:
-		format = bqFormatJSON
+		parsedFormat = bqFormatJSON
 	default:
 		return "", "", fmt.Errorf("unsupported bigquery format %q (supported: json)", format)
 	}
 
-	compression = strings.ToLower(strings.TrimSpace(compression))
-	switch compression {
+	parsedCompression := bqCompression(strings.ToLower(strings.TrimSpace(compression)))
+	switch parsedCompression {
 	case "", bqCompressionNone:
-		compression = bqCompressionNone
+		parsedCompression = bqCompressionNone
 	case bqCompressionGzip:
+		parsedCompression = bqCompressionGzip
 	default:
 		return "", "", fmt.Errorf("unsupported bigquery compression %q (supported: none, gzip)", compression)
 	}
 
-	return format, compression, nil
+	return parsedFormat, parsedCompression, nil
 }
 
 func (p *OutputPluginBigQuery) gzipJSON() bool {
