@@ -45,6 +45,7 @@ func Test_gzipJSONLoadReader_sendsGzipAsIs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer reader.Close()
 
 	got, err := io.ReadAll(reader)
 	if err != nil {

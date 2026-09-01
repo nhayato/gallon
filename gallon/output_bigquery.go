@@ -95,11 +95,11 @@ func (p *OutputPluginBigQuery) Cleanup() error {
 	return p.client.Close()
 }
 
-func gzipJSONLoadReader(file *os.File, decompress bool) (io.ReadCloser, error) {
+func gzipJSONLoadReader(r io.Reader, decompress bool) (io.ReadCloser, error) {
 	if decompress {
-		return gzip.NewReader(file)
+		return gzip.NewReader(r)
 	}
-	return file, nil
+	return io.NopCloser(r), nil
 }
 
 func parseBigQueryLoadOptions(format, compression string) (bqFormat, bqCompression, error) {
@@ -280,9 +280,7 @@ loop:
 	if err != nil {
 		return fmt.Errorf("gzip json reader: %w", err)
 	}
-	if decompress {
-		defer loadReader.Close()
-	}
+	defer loadReader.Close()
 
 	source := bigquery.NewReaderSource(loadReader)
 	source.SourceFormat = bigquery.JSON
