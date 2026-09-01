@@ -52,8 +52,6 @@ func NewOutputPluginBigQuery(
 	schema bigquery.Schema,
 	deserialize func(GallonRecord) ([]bigquery.Value, error),
 	deleteTemporaryTable bool,
-	format bqFormat,
-	compression bqCompression,
 ) *OutputPluginBigQuery {
 	return &OutputPluginBigQuery{
 		client:               client,
@@ -63,8 +61,6 @@ func NewOutputPluginBigQuery(
 		schema:               schema,
 		deserialize:          deserialize,
 		deleteTemporaryTable: deleteTemporaryTable,
-		format:               format,
-		compression:          compression,
 	}
 }
 
@@ -129,7 +125,8 @@ func parseBigQueryLoadOptions(format, compression string) (bqFormat, bqCompressi
 }
 
 func (p *OutputPluginBigQuery) gzipJSON() bool {
-	return p.format == bqFormatJSON && p.compression == bqCompressionGzip
+	// Empty format is JSON, matching parseBigQueryLoadOptions and the constructor zero value.
+	return (p.format == "" || p.format == bqFormatJSON) && p.compression == bqCompressionGzip
 }
 
 func (p *OutputPluginBigQuery) decompressGzipForLoad() bool {
@@ -390,7 +387,7 @@ func NewOutputPluginBigQueryFromConfig(configYml []byte) (*OutputPluginBigQuery,
 		deleteTemporaryTable = *config.DeleteTemporaryTable
 	}
 
-	return NewOutputPluginBigQuery(
+	p := NewOutputPluginBigQuery(
 		client,
 		config.Endpoint,
 		config.DatasetId,
@@ -439,9 +436,10 @@ func NewOutputPluginBigQueryFromConfig(configYml []byte) (*OutputPluginBigQuery,
 			return values, nil
 		},
 		deleteTemporaryTable,
-		format,
-		compression,
-	), nil
+	)
+	p.format = format
+	p.compression = compression
+	return p, nil
 }
 
 func deserializeRecord(data map[string]any, schema bigquery.Schema) (map[string]bigquery.Value, error) {
